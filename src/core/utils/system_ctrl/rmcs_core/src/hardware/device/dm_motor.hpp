@@ -24,6 +24,8 @@ public:
         status_component.register_output(name_prefix + "/torque", torque_, 0.0);
         status_component.register_output(name_prefix + "/max_torque", max_torque_, 0.0);
         status_component.register_output(name_prefix + "/alive", alive_, false);
+        // 电机反馈里的故障码:0=禁用 1=使能 8=过压 ... 13=通信故障
+        status_component.register_output(name_prefix + "/error_code", error_code_, 0.0);
 
         command_component.register_input(name_prefix + "/control_torque", control_torque_, false);
         command_component.register_input(
@@ -53,7 +55,13 @@ public:
 
         if (alive_watchdog_.tick()) {
             *alive_ = false;
-            RCLCPP_WARN(rclcpp::get_logger("HW_Diag"), "Dm Motor %s offline!", motor_name_.c_str());
+            // 看门狗每 50ms 超时一次,反馈零散时日志会刷屏,限流到 2 秒一条。
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_offline_warn_ >= std::chrono::seconds(2)) {
+                last_offline_warn_ = now;
+                RCLCPP_WARN(
+                    rclcpp::get_logger("HW_Diag"), "Dm Motor %s offline!", motor_name_.c_str());
+            }
         }
 
         *angle_ = angle();
@@ -61,6 +69,7 @@ public:
         *velocity_ = velocity();
         *torque_ = torque();
         *velocity_filtered_ = velocity_lpf_.update(velocity());
+        *error_code_ = static_cast<double>(static_cast<int>(last_error_msg()));
     }
 
     void store_status(uint64_t can_data) {
@@ -98,12 +107,14 @@ private:
     rmcs_executor::Component::OutputInterface<double> torque_;
     rmcs_executor::Component::OutputInterface<double> max_torque_;
     rmcs_executor::Component::OutputInterface<bool> alive_;
+    rmcs_executor::Component::OutputInterface<double> error_code_;
 
     rmcs_executor::Component::InputInterface<double> control_velocity_;
     rmcs_executor::Component::InputInterface<double> control_torque_;
 
     std::string motor_name_;
     rmcs_utility::TickTimer alive_watchdog_;
+    std::chrono::steady_clock::time_point last_offline_warn_{};
     rmcs_core::utility::LowPassFilter<> velocity_lpf_{4, 1000};
 };
 

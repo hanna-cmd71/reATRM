@@ -3,6 +3,7 @@
 #include "rmcs_utility/tick_timer.hpp"
 #include "utility/low_pass_filter.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <librmcs/device/dji_motor.hpp>
 #include <rclcpp/logger.hpp>
@@ -50,8 +51,12 @@ public:
 
         if (alive_watchdog_.tick()) {
             *alive_ = false;
-            RCLCPP_WARN(
-                rclcpp::get_logger("HW_Diag"), "Dji Motor %s offline!", motor_name_.c_str());
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_offline_warn_ >= std::chrono::seconds(2)) {
+                last_offline_warn_ = now;
+                RCLCPP_WARN(
+                    rclcpp::get_logger("HW_Diag"), "Dji Motor %s offline!", motor_name_.c_str());
+            }
         }
         *angle_ = angle();
         *raw_angle_ = last_raw_angle();
@@ -91,6 +96,7 @@ private:
 
     std::string motor_name_;
     rmcs_utility::TickTimer alive_watchdog_;
+    std::chrono::steady_clock::time_point last_offline_warn_{};
     rmcs_core::utility::LowPassFilter<> velocity_lpf_{4, 1000};
 };
 

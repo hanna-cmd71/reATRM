@@ -3,6 +3,7 @@
 #include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_msgs/msg/string.hpp"
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <eigen3/Eigen/Dense>
@@ -50,6 +51,7 @@ public:
             register_input("/arm/joint_" + std::to_string(i + 1) + "/motor/alive", joint_alive_[i], false);
         }
         register_input("/vt03/mode_switch", mode_switch_);
+        register_input("/vt03/trigger", trigger_);
 
         register_output("urdf_loaded", is_load, false);
 
@@ -72,15 +74,26 @@ public:
                 return;
             }
             for (std::size_t i = 0; i < num_joints_; ++i) {
+                const double desired = msg->data[i];
+                if (!std::isfinite(desired))
+                    continue;
                 const double theta_measured = joint[i].get_angle();
                 if (!std::isfinite(theta_measured)) {
                     RCLCPP_WARN(get_logger(), "set_offsets: joint_%zu no feedback (NAN), skipped",i + 1);
                         continue;
                 }
-                const double desired = msg->data[i];
-                if (!std::isfinite(desired)) continue;
                 default_joint_offsets_[i] += theta_measured - desired;
-                angle_baseline_ready_[i] = true;
+                const bool needs_latch =
+                    std::find(latch_joints_.begin(), latch_joints_.end(), i) != latch_joints_.end();
+                if (needs_latch) {
+                    RCLCPP_WARN(
+                        get_logger(),
+                        "set_offsets: joint_%zu needs latch, offset applied but baseline still "
+                        "requires the trigger",
+                        i + 1);
+                } else {
+                    angle_baseline_ready_[i] = true;
+                }
             }
             RCLCPP_INFO(get_logger(),"ArmCalib: offsets updated -> [%.6f, %.6f, %.6f, %.6f, %.6f, %.6f]",
                 default_joint_offsets_[0], default_joint_offsets_[1], default_joint_offsets_[2],
@@ -113,6 +126,10 @@ public:
 
             joint[i].update(calibrated_angles[i], calibrated_velocities[i], *joint_torque_[i]);
         }
+
+        if (trigger_.ready() && *trigger_ && !last_trigger_)
+            latch_by_trigger();
+        last_trigger_ = trigger_.ready() && *trigger_;
 
         *reference_latched_ = angle_baseline_ok() ? 1.0 : 0.0;
         *offsets_verified_ = offsets_verified_parameter_ && latch_interlock_ok();
@@ -150,8 +167,6 @@ private:
         }
     }
 
-    /// 电机轴到输出轴的减速比。编码器在电机侧时需要除;直驱填 1。
-    /// 待 librmcs 侧按"编码器在哪一侧"统一换算后,本参数与下面的除法一起删除。
     void load_gear_ratios() {
         if (!this->has_parameter("joint_gear_ratio"))
             this->declare_parameter(
@@ -199,8 +214,6 @@ private:
         }
     }
 
-    /// 关节角来源:电机多圈角除以减速比,得到输出轴角度
-    /// 减速比换算收敛到 librmcs 之后,这里可以直接返回 *joint_angle_[index]
     double joint_source_angle(std::size_t index) const {
         return *joint_angle_[index] / joint_gear_ratio_[index];
     }
@@ -221,14 +234,14 @@ private:
         const bool baseline_ok = angle_baseline_ok();
         if (baseline_ok != last_baseline_ok_) {
             last_baseline_ok_ = baseline_ok;
-            if (baseline_ok) {
+            if (baseline_ok)
                 RCLCPP_INFO(get_logger(), "ArmCalib: angle baseline ready");
-            } else {
-                RCLCPP_WARN(
-                    get_logger(),
-                    "ArmCalib: angle baseline missing; move the joints listed in latch_joints to "
-                    "their reference pose, then publish /arm/config/latch_reference");
-            }
+        }
+        if (!baseline_ok) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *this->get_clock(), 5000,
+                "ArmCalib: J2/J3 angle baseline missing; push them onto the mechanical stops with "
+                "the mode switch on the left, then press the trigger");
         }
         if (baseline_ok && !offsets_verified_parameter_ && !offset_parameter_warned_) {
             offset_parameter_warned_ = true;
@@ -256,38 +269,69 @@ private:
                 RCLCPP_WARN(get_logger(), "ArmLatch: invalid joint id %d, skipped", joint_id);
                 continue;
             }
-            const std::size_t index = static_cast<std::size_t>(joint_id) - 1;
-            if (!std::isfinite(latch_reference_angle_[index])) {
-                RCLCPP_WARN(
-                    get_logger(), "ArmLatch: joint_%zu has no latch_reference_angle_j%zu, skipped",
-                    index + 1, index + 1);
-                continue;
-            }
-            if (!joint_alive_[index].ready() || !*joint_alive_[index]) {
-                RCLCPP_WARN(get_logger(), "ArmLatch: joint_%zu motor offline, skipped", index + 1);
-                continue;
-            }
-            const double velocity = *joint_velocity_[index];
-            if (!std::isfinite(velocity) || std::abs(velocity) > latch_velocity_threshold_) {
-                RCLCPP_WARN(
-                    get_logger(), "ArmLatch: joint_%zu moving at %.3f rad/s, hold it still",
-                    index + 1, velocity);
-                continue;
-            }
-            const double source_angle = joint_source_angle(index);
-            if (!std::isfinite(source_angle)) {
-                RCLCPP_WARN(
-                    get_logger(), "ArmLatch: joint_%zu source angle invalid, skipped", index + 1);
-                continue;
-            }
-            const double previous_offset = default_joint_offsets_[index];
-            default_joint_offsets_[index] = source_angle - latch_reference_angle_[index];
-            angle_baseline_ready_[index] = true;
-            RCLCPP_INFO(
-                get_logger(), "ArmLatch: joint_%zu latched at %.4f rad, offset %.6f -> %.6f",
-                index + 1, latch_reference_angle_[index], previous_offset,
-                default_joint_offsets_[index]);
+            latch_one(static_cast<std::size_t>(joint_id) - 1);
         }
+    }
+    void latch_by_trigger() {
+        const auto switch_position = *mode_switch_;
+        if (switch_position != rmcs_msgs::VtSwitch::LEFT
+            && switch_position != rmcs_msgs::VtSwitch::UNKNOWN) {
+            RCLCPP_WARN(
+                rclcpp::get_logger("ArmLatch"),
+                "arm is enabled, refuse; put the mode switch to the left");
+            return;
+        }
+        if (latch_joints_.empty()) {
+            RCLCPP_WARN(rclcpp::get_logger("ArmLatch"), "latch_joints is empty, nothing to do");
+            return;
+        }
+        std::size_t latched = 0;
+        for (const std::size_t index : latch_joints_) {
+            if (latch_one(index))
+                ++latched;
+        }
+        if (latched == latch_joints_.size()) {
+            RCLCPP_INFO(
+                rclcpp::get_logger("ArmLatch"), "baseline rebuilt by trigger (%zu joints)",
+                latched);
+        } else {
+            RCLCPP_WARN(
+                rclcpp::get_logger("ArmLatch"), "only %zu/%zu joints latched, see warnings above",
+                latched, latch_joints_.size());
+        }
+    }
+
+    bool latch_one(std::size_t index) {
+        if (!std::isfinite(latch_reference_angle_[index])) {
+            RCLCPP_WARN(
+                get_logger(), "ArmLatch: joint_%zu has no latch_reference_angle_j%zu, skipped",
+                index + 1, index + 1);
+            return false;
+        }
+        if (!joint_alive_[index].ready() || !*joint_alive_[index]) {
+            RCLCPP_WARN(get_logger(), "ArmLatch: joint_%zu motor offline, skipped", index + 1);
+            return false;
+        }
+        const double velocity = *joint_velocity_[index];
+        if (!std::isfinite(velocity) || std::abs(velocity) > latch_velocity_threshold_) {
+            RCLCPP_WARN(
+                get_logger(), "ArmLatch: joint_%zu moving at %.3f rad/s, hold it still", index + 1,
+                velocity);
+            return false;
+        }
+        const double source_angle = joint_source_angle(index);
+        if (!std::isfinite(source_angle)) {
+            RCLCPP_WARN(
+                get_logger(), "ArmLatch: joint_%zu source angle invalid, skipped", index + 1);
+            return false;
+        }
+        const double previous_offset = default_joint_offsets_[index];
+        default_joint_offsets_[index] = source_angle - latch_reference_angle_[index];
+        angle_baseline_ready_[index] = true;
+        RCLCPP_INFO(
+            get_logger(), "ArmLatch: joint_%zu latched at %.4f rad, offset %.6f -> %.6f", index + 1,
+            latch_reference_angle_[index], previous_offset, default_joint_offsets_[index]);
+        return true;
     }
 
     double default_joint_offsets_[num_joints_]{};
@@ -307,11 +351,12 @@ private:
     rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr latch_reference_sub_;
     std::array<InputInterface<bool>, num_joints_> joint_alive_;
     InputInterface<rmcs_msgs::VtSwitch> mode_switch_;
+    InputInterface<bool> trigger_;
+    bool last_trigger_{false};
 
     void modify_link_length(const urdf::Model& model) {
         link[0].load_length(model.getJoint("joint_2")->parent_to_joint_origin_transform.position.z);
         link[1].load_length(model.getJoint("joint_3")->parent_to_joint_origin_transform.position.y);
-        // 小臂长度 = 沿 link_3 的 y 轴到肘的距离;原来的 .x 是横向偏置(-0.005),取错了字段
         link[2].load_length(model.getJoint("joint_4")->parent_to_joint_origin_transform.position.y);
         link[3].load_length(
             model.getJoint("joint_4")->parent_to_joint_origin_transform.position.y

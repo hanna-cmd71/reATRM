@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <limits>
 
 #include "rmcs_utility/tick_timer.hpp"
@@ -55,7 +56,14 @@ public:
 
         if (alive_watchdog_.tick()) {
             *alive_ = false;
-            RCLCPP_WARN(rclcpp::get_logger("HW_Diag"), "Lk Motor %s offline!", motor_name_.c_str());
+            // CAN 抖动、或电机失能后不回帧都会让看门狗超时。限流到 2 秒一次,
+            // 否则每次反馈重新对上后 50ms 就会再报一次,日志会被刷屏。
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_offline_warn_ >= std::chrono::seconds(2)) {
+                last_offline_warn_ = now;
+                RCLCPP_WARN(
+                    rclcpp::get_logger("HW_Diag"), "Lk Motor %s offline!", motor_name_.c_str());
+            }
         }
         
         *angle_ = angle();
@@ -159,6 +167,7 @@ private:
 
     std::string motor_name_;
     rmcs_utility::TickTimer alive_watchdog_;
+    std::chrono::steady_clock::time_point last_offline_warn_{};
 
     bool first_generate_auto_command_ = true;
 };

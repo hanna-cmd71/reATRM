@@ -25,19 +25,19 @@ public:
                 get_component_name(),
                 rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true))
         , joint_angle_pid_controller{
-                pid::PidCalculator(100.0, 0.0, 0.0),
-                pid::PidCalculator(800.0, 0.0, 0.0),
-                pid::PidCalculator(200.0, 0.0, 0.0),
-                pid::PidCalculator(200.0, 0.0, 0.0),
-                pid::PidCalculator(400.0, 0.0, 0.0),
-                pid::PidCalculator(20.0, 0.0, 1.0)   }
+                pid::PidCalculator(100.0, 0.0, 0.0),   
+                pid::PidCalculator(270.0, 0.0, 0.0),   
+                pid::PidCalculator(175.0, 0.0, 0.0),   
+                pid::PidCalculator(50.0, 0.0, 0.0),    
+                pid::PidCalculator(38.0, 0.0, 0.0),    
+                pid::PidCalculator(10.0, 0.0, 0.0) }   
         , joint_vel_pid_controller{
-                pid::PidCalculator(1.0, 0.0, 0.0),
-                pid::PidCalculator(1.0, 0.0, 0.0),
-                pid::PidCalculator(1.0, 0.0, 0.0),
-                pid::PidCalculator(0.2, 0.0, 0.0),
-                pid::PidCalculator(0.2, 0.0, 0.0),
-                pid::PidCalculator(0.1, 0.0, 0.1)   } 
+                pid::PidCalculator(5.0, 0.0, 0.0),    
+                pid::PidCalculator(3.0, 0.0, 0.0),     
+                pid::PidCalculator(1.6, 0.0, 0.0),     
+                pid::PidCalculator(2.0, 0.0, 0.0),     
+                pid::PidCalculator(4.0, 0.0, 0.0),     
+                pid::PidCalculator(0.5, 0.0, 0.0) }    
         {
             for(std::size_t i = 0; i < 6; ++i){
                 const std::string joint_prefix = "/arm/joint_" + std::to_string(i+1);
@@ -46,22 +46,15 @@ public:
                 register_input(joint_prefix + "/lower_limit", joint_lower_limit_[i]);
                 register_input(joint_prefix + "/upper_limit", joint_upper_limit_[i]);
                 register_input(joint_prefix + "/velocity", joint_velocity_[i]);
-                register_input(joint_prefix + "/friction", joint_friction_[i]);
 
                 register_output(joint_prefix + "/motor/control_torque", target_torque_[i], NAN);
             }
-            for(std::size_t i = 0; i < 6; ++i){
-                const std::string joint_prefix = "/arm/link_" + std::to_string(i+1);
-                register_input(joint_prefix + "/mass", link_mass_[i]);
-                register_input(joint_prefix + "/length", link_length_[i]);
-                register_input(joint_prefix + "/com", link_com_[i]);
-            }
             register_input("urdf_loaded", is_loaded);
-            register_input("/arm/joint_4/position", joint4_position);
             register_input("/arm/enable_flag", is_arm_enable);
 
             register_input("/arm/config/offsets_verified", offsets_verified_, false);
 
+            last_target_theta_.fill(NAN);
             const auto list = this->get_parameter("controller_list").as_string_array();
             load_controller_list(list);
         }
@@ -133,77 +126,46 @@ private:
         return torque_pid;
     }
     TorqueVec gravity_calculate(){
-        //Todo
-        static constexpr double g       = 9.81;
-        static constexpr double reverse = -1.0;
-        const double theta_1            = -(*joint_theta[1]);
-        const double theta_2            = -*joint_theta[2] + std::numbers::pi / 2.0;
-        const double theta_4            = -*joint_theta[3];
-        const double theta_3            = -*joint_theta[4];
+        //   G1 大臂     Th1 = q2
+        //   G2 小臂     Th2 = q2 + q3
+        //   G3 腕+末端  Th3 = q2 + q3 - q5   
+        //   一阶矩 P*cos(Th) + Q*sin(Th)
+        const double theta1 = *joint_theta[1];
+        const double theta2 = theta1 + *joint_theta[2];
+        const double theta3 = theta2 - *joint_theta[4];
 
-        const double mass_1 = *link_mass_[1];
-        const double mass_2 = (*link_mass_[3] + *link_mass_[2]);
-        const double mass_3 = (*link_mass_[4] + *link_mass_[5]);
+        const double c1 = std::cos(theta1);
+        const double s1 = std::sin(theta1);
+        const double c2 = std::cos(theta2);
+        const double s2 = std::sin(theta2);
+        const double c3 = std::cos(theta3);
+        const double s3 = std::sin(theta3);
 
-        const double l_1m = link_com_[1]->y();
-        const double l_2m = ((link_com_[2]->y() * (*link_mass_[2]))
-                             + ((joint4_position->y() + link_com_[3]->z()) * (*link_mass_[3])))
-                          / ((*link_mass_[2] + *link_mass_[3]));
-        constexpr double l_3m = 0.08;
-
-        const double l1  = *link_length_[1];
-        const double l2  = *link_length_[2];
-        const double s12 = sin(theta_1 + theta_2);
-
-        const double x     = sin(theta_3) * cos(theta_4);
-        const double phi   = std::asin(std::clamp(x, -1.0, 1.0));
-        const double denom = std::sqrt(std::max(0.0, 1.0 - x * x));
-
-        const double k_5 = (denom > 0.0) ? ((cos(theta_3) * cos(theta_4)) / denom) : 0.0;
-
-        const double k = l_3m * sin(theta_1 + theta_2 + phi);
-
-        const double joint_5_tau_g = (-k * mass_3 * k_5) * g;
-        const double joint_4_tau_g = (-mass_3 * l_3m * sin(theta_3) * sin(theta_4) * s12) * g;
-        const double joint_3_tau_g = (-l_2m * s12 * mass_2 - (l2 * s12 + k) * mass_3) * g;
-
-        const double k_2          = -l_1m * sin(theta_1) * mass_1;
-        const double j_2          = -l1 * sin(theta_1) - l_2m * s12;
-        const double i_2          = -(l1 * sin(theta_1) + l2 * s12 + k);
-        const double joint2_tau_g = (k_2 + j_2 * mass_2 + i_2 * mass_3) * g;
-        double k_j2 = 1;
-        double k_j3 = 5;
         TorqueVec torque_gravity;
         torque_gravity.setZero();
-
-        torque_gravity(1) = reverse * joint2_tau_g * k_j2; 
-        torque_gravity(2) = reverse * joint_3_tau_g * k_j3 * (-1);
-        torque_gravity(3) = joint_4_tau_g;
-        torque_gravity(4) = reverse * joint_5_tau_g;
-        // RCLCPP_INFO_THROTTLE(
-        // rclcpp::get_logger("ArmSolver"), *this->get_clock(), 500,
-        // "Gravity Torque J3: %.3f", 
-        // torque_gravity(2));
+        torque_gravity(1) = kGravityP1 * c1 + kGravityQ1 * s1 + kGravityP2 * c2 + kGravityQ2 * s2
+                          + kGravityP3 * c3 + kGravityQ3 * s3 + kGravityE2;
+        torque_gravity(2) = kGravityP2 * c2 + kGravityQ2 * s2 + kGravityP3 * c3 + kGravityQ3 * s3
+                          + kGravityE3;
+        torque_gravity(4) = kGravityP3 * c3 + kGravityQ3 * s3 + kGravityE5;
         return torque_gravity;
     }
     TorqueVec friction_calculate(){
-        //Todo
-        TorqueVec joint_vel, tau_c;
+        TorqueVec torque_friction;
+        torque_friction.setZero();
         for (std::size_t i = 0; i < 6; ++i) {
-            joint_vel(i) = *joint_velocity_[i];
-            tau_c(i)     = *joint_friction_[i];
+            const double target = *joint_target_theta[i];
+            const double target_velocity =
+                (std::isfinite(target) && std::isfinite(last_target_theta_[i]))
+                    ? (target - last_target_theta_[i]) * kUpdateRateHz
+                    : 0.0;
+            last_target_theta_[i] = target;
+
+            if (kFrictionTorque[i] <= 0.0)
+                continue;
+            torque_friction(i) =
+                kFrictionTorque[i] * std::tanh(target_velocity / kFrictionVelocity[i]);
         }
-
-        TorqueVec speed_threshold;
-        speed_threshold << 0.6, 0.2, 0.5, 0.6, 0.6, 0.6;
-
-        TorqueVec torque_friction = tau_c * (joint_vel / speed_threshold).tanh();
-
-        torque_friction(0) = 0.0; 
-        // torque_friction(1) = 0.0; 
-        torque_friction(4) = 0.0; 
-        torque_friction(5) = 0.0; 
-
         return torque_friction;
     }
     TorqueVec zero_calculate(){
@@ -217,6 +179,7 @@ private:
          {"friction", &ArmSolver::friction_calculate},
          {"zero_torque", &ArmSolver::zero_calculate}}
     };
+
     void load_controller_list(const std::vector<std::string>& list){
         //todo Queue->gravity + friction + control_torque
         controller_list_.clear();
@@ -244,17 +207,28 @@ private:
     }
     std::array<pid::PidCalculator, 6> joint_angle_pid_controller;
     std::array<pid::PidCalculator, 6> joint_vel_pid_controller;
+    //重力模型系数(静态辨识结果,单位 N*m)
+    static constexpr double kGravityP1 = 20.284;
+    static constexpr double kGravityQ1 = -60.824;
+    static constexpr double kGravityP2 = -15.112;
+    static constexpr double kGravityQ2 = 2.680;
+    static constexpr double kGravityP3 = -0.579;
+    static constexpr double kGravityQ3 = 0.380;
+    static constexpr double kGravityE2 = -22.244;
+    static constexpr double kGravityE3 = 1.534;
+    static constexpr double kGravityE5 = 2.601;
+    static constexpr std::array<double, 6> kFrictionTorque = {0.0, 11.6, 7.4, 0.0, 0.75, 0.0};
+    static constexpr std::array<double, 6> kFrictionVelocity = {0.2, 0.2, 0.2, 0.2, 0.2, 0.2};
+
+    std::array<double, 6> last_target_theta_{};  
+    static constexpr double kUpdateRateHz = 1000.0;  
+
     std::array<InputInterface<double>, 6>  joint_theta;
     std::array<InputInterface<double>, 6>  joint_target_theta;
     std::array<InputInterface<double>, 6>  joint_lower_limit_;
     std::array<InputInterface<double>, 6>  joint_upper_limit_;
     std::array<InputInterface<double>, 6>  joint_velocity_;
-    std::array<InputInterface<double>, 6>  joint_friction_;
     std::array<OutputInterface<double>, 6>  target_torque_;
-    std::array<InputInterface<double>, 6>  link_mass_;
-    std::array<InputInterface<double>, 6>  link_length_;
-    std::array<InputInterface<Eigen::Vector3d>, 6>  link_com_;
-    InputInterface<Eigen::Vector3d> joint4_position;
     InputInterface<bool> is_loaded;
     InputInterface<bool> is_arm_enable;
     InputInterface<bool> offsets_verified_;      

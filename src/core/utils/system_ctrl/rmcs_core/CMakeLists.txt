@@ -13,6 +13,7 @@ endif()
 find_package (ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies ()
 find_package(urdf REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 file (GLOB_RECURSE PROJECT_SOURCE CONFIGURE_DEPENDS
   ${PROJECT_SOURCE_DIR}/src/*.cpp
@@ -35,7 +36,7 @@ include_directories(${PROJECT_SOURCE_DIR}/librmcs)
 
 include_directories(SYSTEM "/usr/include/libusb-1.0")
 
-target_link_libraries(${PROJECT_NAME} -lusb-1.0)
+target_link_libraries(${PROJECT_NAME} -lusb-1.0 yaml-cpp)
 
 pluginlib_export_plugin_description_file(rmcs_executor plugins.xml)
 

@@ -25,5 +25,6 @@
     },
     "C_Cpp.intelliSenseEngine": "disabled",
     "ROS2.distro": "jazzy",
-    "github.copilot.chat.codeGeneration.useInstructionFiles": true
+    "github.copilot.chat.codeGeneration.useInstructionFiles": true,
+    "cmake.sourceDirectory": "/home/hanner/reATRM/src/bringup"
 }

@@ -112,12 +112,15 @@ private:
             , arm_joint5_motor_(
                   engineer, engineer_command, "/arm/joint_5/motor",
                   device::DmMotor::Config{device::DmMotor::Type::J4310}
-                  .set_reversed()
                   .set_encoder_zero_point(static_cast<int>(engineer.get_parameter("arm_joint5_motor_zero_point").as_int())))
             , arm_joint6_motor_(
                   engineer, engineer_command, "/arm/joint_6/motor",
                   device::DmMotor::Config{device::DmMotor::Type::J4310}
                   .set_encoder_zero_point(static_cast<int>(engineer.get_parameter("arm_joint6_motor_zero_point").as_int())))
+            , gripper_motor_(
+                  engineer, engineer_command, "/gripper/motor",
+                  device::DmMotor::Config{device::DmMotor::Type::J4310}
+                  .set_encoder_zero_point(static_cast<int>(engineer.get_parameter("gripper_motor_zero_point").as_int())))
             , transmit_buffer_(*this, 32)
             , event_thread_([this]() { handle_events(); }) {}
 
@@ -133,9 +136,23 @@ private:
             arm_joint4_motor_.update_status();
             arm_joint5_motor_.update_status();
             arm_joint6_motor_.update_status();
+            gripper_motor_.update_status();
         }
         void command_update() {
             static bool even_phase{true};
+            // 上电后先给两个 LK 电机补发几帧"运行"命令(0x88):
+            // 电机若停在 shutdown 状态,会照常回帧但不执行任何控制指令,
+            // 表现为"在线、手动能转、就是控制不了"。0x88 把它切回运行状态。
+            static int startup_handshake{0};
+            if (startup_handshake < 100) {
+                ++startup_handshake;
+                transmit_buffer_.add_can2_transmission(
+                    0x141, device::LkMotor::generate_startup_command());
+                transmit_buffer_.add_can2_transmission(
+                    0x142, device::LkMotor::generate_startup_command());
+                transmit_buffer_.trigger_transmission();
+                return;
+            }
             if (even_phase) {
                 transmit_buffer_.add_can1_transmission(
                     0x02, arm_joint1_motor_.generate_torque_command());
@@ -150,6 +167,8 @@ private:
                     0x04, arm_joint5_motor_.generate_torque_command());
                 transmit_buffer_.add_can1_transmission(
                     0x05, arm_joint6_motor_.generate_torque_command());
+                transmit_buffer_.add_can1_transmission(
+                    0x06, gripper_motor_.generate_torque_command());
             }
             transmit_buffer_.trigger_transmission();
             even_phase = !even_phase;
@@ -172,6 +191,8 @@ private:
                 arm_joint6_motor_.store_status(can_data);
             } else if (can_id == 0x212) {
                 arm_joint1_motor_.store_status(can_data);
+            } else if (can_id == 0x56) {
+                gripper_motor_.store_status(can_data);
             }
         }
         void can2_receive_callback(
@@ -196,6 +217,7 @@ private:
         device::DmMotor arm_joint4_motor_;
         device::DmMotor arm_joint5_motor_;
         device::DmMotor arm_joint6_motor_;
+        device::DmMotor gripper_motor_;
         librmcs::client::CBoard::TransmitBuffer transmit_buffer_;
         std::thread event_thread_;
     };

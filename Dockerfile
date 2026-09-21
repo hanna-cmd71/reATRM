@@ -57,6 +57,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 50 && \
     update-alternatives --install /usr/bin/clangd clangd /usr/bin/clangd-$version 50
 
+RUN rm -f /etc/apt/sources.list.d/*llvm* /etc/apt/sources.list.d/*tuna* /etc/apt/sources.list.d/*tsinghua*R
+
 RUN apt-get update && apt-get install -y \
     clangd clang clang-format python3-pip vim htop \
     gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \

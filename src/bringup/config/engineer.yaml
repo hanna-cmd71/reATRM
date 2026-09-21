@@ -32,11 +32,13 @@ value_broadcaster:
       - /arm/joint_4/motor/velocity
       - /arm/joint_5/motor/velocity
       - /arm/joint_6/motor/velocity
+      - /arm/joint_1/motor/control_torque
       - /arm/joint_2/motor/control_torque
+      - /arm/joint_3/motor/control_torque
+      - /arm/joint_4/motor/control_torque
+      - /arm/joint_5/motor/control_torque
+      - /arm/joint_6/motor/control_torque
       - /arm/config/reference_latched
-      - /vt03/mode_switch
-      - /arm/enable_flag
-      - /arm/mode
 
 engineer_hardware:
   ros__parameters:
@@ -48,11 +50,12 @@ engineer_hardware:
     arm_joint4_motor_zero_point: 31294
     arm_joint5_motor_zero_point: 32801
     arm_joint6_motor_zero_point: 30864
+    gripper_motor_zero_point: 0
 
 arm_config:
   ros__parameters:
     offsets_verified: true
-    default_joint_offsets: [8.666224, 1.297994, -1.391739, 7.481991, 4.656399, 1.559291]
+    default_joint_offsets: [8.666224, 1.383695, -1.403292, 7.481991, 7.946020, 1.559291]
     require_latch: false
     latch_joints: [2, 3]
     latch_reference_angle_j2: -1.3265
@@ -60,10 +63,13 @@ arm_config:
     latch_velocity_threshold: 0.1      
     joint_gear_ratio: [1.0, 50.0, 50.0, 1.0, 1.0, 1.0]
 
+arm_controller:
+  ros__parameters:
+    actions_file: "/home/ws/src/bringup/config/arm_actions.yaml"
+
 arm_solver:
   ros__parameters:
-    controller_list: ["gravity","friction"]
-   #controller_list: ["gravity","friction","pid"]
+    controller_list: ["gravity","friction","pid"]
 
 # chassis_controller:
 #   ros__parameters:
