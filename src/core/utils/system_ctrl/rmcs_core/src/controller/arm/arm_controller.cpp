@@ -7,8 +7,10 @@
 #include <cstring>
 #include <eigen3/Eigen/Dense>
 #include <eigen3/Eigen/src/Core/util/Meta.h>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <rclcpp/duration.hpp>
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
@@ -24,7 +26,6 @@
 #include <string>
 #include <vector>
 #include <rmcs_executor/component.hpp>
-#include "utility/low_pass_filter.hpp"
 #include <rmcs_msgs/arm_mode.hpp>
 #include <rmcs_msgs/vtswitch.hpp>
 #include "controller/arm/Action_planner/action_step.hpp"
@@ -41,7 +42,7 @@ public:
         : Node(
                 get_component_name(),
                 rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) 
-        , custom_joint_filter_(0.2){
+        {
             register_input("/vt03/mode_switch", mode_switch_);
             register_input("/vt03/fn_1", fn_1_);
             register_input("/vt03/fn_2", fn_2_);
@@ -55,8 +56,15 @@ public:
                 register_input(joint_prefix + "/lower_limit", joint_lower_limit_[i]);
                 register_input(joint_prefix + "/upper_limit", joint_upper_limit_[i]);
                 register_output(joint_prefix + "/target_theta", target_theta[i], NAN);
+                // Velocity feedforward. Without it J5 trails J3 by about half a second
+                // and the tool path bends, because the tool position is a near
+                // cancellation of the two joints.
+                register_output(joint_prefix + "/target_velocity", target_velocity[i], 0.0);
             }
             register_output("/arm/enable_flag", is_arm_enable_, false);
+            register_output("/arm/drag_enable", is_drag_enabled_, false);
+            register_output("/gripper/target_theta", gripper_target_, NAN);
+            register_input("/gripper/motor/angle", gripper_angle_);
 
             action_status_pub_ = this->create_publisher<std_msgs::msg::String>(
                 "/arm/action/status", rclcpp::QoS{1});
@@ -65,6 +73,15 @@ public:
                 [this](const std_msgs::msg::String::ConstSharedPtr msg) {
                     start_action(msg->data);
                 });
+            // Reload the action table without restarting and re-calibrating.
+            action_reload_sub_ = this->create_subscription<std_msgs::msg::String>(
+                "/arm/action/reload", rclcpp::QoS{1},
+                [this](const std_msgs::msg::String::ConstSharedPtr) {
+                    if (!load_actions_once())
+                        RCLCPP_WARN(get_logger(), "Action: reload failed, keep previous table");
+                });
+
+            load_actions_once();
 
             tuning_target_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
                 "/arm/tuning/joint_target", rclcpp::QoS{1},
@@ -79,23 +96,6 @@ public:
                         tuning_target_[i] = msg->data[i];
                 });
 
-            if (!this->has_parameter("actions_file"))
-                this->declare_parameter("actions_file", std::string{});
-            const auto actions_file = this->get_parameter("actions_file").as_string();
-            if (actions_file.empty()) {
-                RCLCPP_WARN(get_logger(), "Action: actions_file is not set, no action available");
-            } else {
-                try {
-                    actions_ = ActionLoader::load(actions_file);
-                    RCLCPP_INFO(
-                        get_logger(), "Action: loaded %zu action(s) from %s", actions_.size(),
-                        actions_file.c_str());
-                    for (const auto& [name, steps] : actions_)
-                        RCLCPP_INFO(get_logger(), "  - %s (%zu steps)", name.c_str(), steps.size());
-                } catch (const std::exception& error) {
-                    RCLCPP_ERROR(get_logger(), "Action: %s", error.what());
-                }
-            }
         }
         ~ArmController() override = default;
 
@@ -103,6 +103,8 @@ public:
             using namespace rmcs_msgs;
             auto sw = *mode_switch_;
             static bool initial_check_done{false};
+
+            watch_actions_file();
 
             if (!initial_check_done) {
                 *is_arm_enable_ = false;
@@ -116,6 +118,7 @@ public:
             if ((sw == VtSwitch::LEFT || sw == VtSwitch::UNKNOWN)) {
                 *is_arm_enable_ = false;
                 *arm_mode_ = ArmMode::None;
+                abort_action();
                 reset();
                 last_arm_mode_ = ArmMode::None;
                 return;
@@ -159,6 +162,14 @@ public:
                             }
                         }
                         break;
+                    case ArmMode::Drag:
+                        // Lock every joint at the current pose before entering drag; only
+                        // the wrist follows the hand in execute_drag().
+                        for (std::size_t i = 0; i < 6; ++i) {
+                            if (theta[i].ready() && !std::isnan(*theta[i]))
+                                *target_theta[i] = *theta[i];
+                        }
+                        break;
                     case ArmMode::Gripper:
                         break;
                     case ArmMode::None:
@@ -168,56 +179,95 @@ public:
                         break;
                 }
             }
+            // Feedforward velocity is zero by default, only the action executor sets it.
+            for (std::size_t i = 0; i < 6; ++i)
+                *target_velocity[i] = 0.0;
             action_update();
             if (action_phase_ == ActionPhase::Idle)
                 arm_control();
+            *is_drag_enabled_ = (*arm_mode_ == ArmMode::Drag);
+            gripper_control();
             last_fn_1_ = *fn_1_;
             last_fn_2_ = *fn_2_;
             last_arm_mode_ = *arm_mode_;
         }
 
 private:
-    void mode_selection() {
-        auto sw = *mode_switch_;
-        using namespace rmcs_msgs;
-        if (sw == VtSwitch::MIDDLE && fn1_toggle_ == false) {        
-                *arm_mode_ = ArmMode::execute_vt03_position;
-        }else if(sw == VtSwitch::MIDDLE && fn1_toggle_ == true) {
-                *arm_mode_ = ArmMode::execute_vt03_orientation;
-        }else if(sw == VtSwitch::RIGHT && fn2_toggle_ == false) {
-                *arm_mode_ = ArmMode::Gripper;
-        }else if(sw == VtSwitch::RIGHT && fn2_toggle_ == true) {
-                *arm_mode_ = ArmMode::Custome;
-        }else{
-            *arm_mode_ = ArmMode::None;
+    bool load_actions_once(){
+        if (!this->has_parameter("actions_file"))
+            this->declare_parameter("actions_file", std::string{});
+        const auto actions_file = this->get_parameter("actions_file").as_string();
+        actions_file_path_ = actions_file;
+        if (actions_file.empty()) {
+            RCLCPP_WARN(get_logger(), "Action: actions_file is not set, no action available");
+            return false;
+        }
+        try {
+            auto loaded = ActionLoader::load(actions_file);
+            actions_ = std::move(loaded);
+            RCLCPP_INFO(
+                get_logger(), "Action: loaded %zu action(s) from %s", actions_.size(),
+                actions_file.c_str());
+            for (const auto& [name, steps] : actions_)
+                RCLCPP_INFO(get_logger(), "  - %s (%zu steps)", name.c_str(), steps.size());
+            return true;
+        } catch (const std::exception& error) {
+            RCLCPP_ERROR(get_logger(), "Action: %s", error.what());
+            return false;
         }
     }
-    void arm_control(){
-        switch(*arm_mode_){
-            using namespace rmcs_msgs;
-            case ArmMode::Custome: {
-                execute_custome();
-                break;
-            }
-            case ArmMode::execute_vt03_position:{
-                Vt03_Position_Control();
-                break;
-            }
-            case ArmMode::execute_vt03_orientation:{
-                Vt03_Orientation_Control();
-                break;
-            }
-            case ArmMode::Gripper: {
-                Gripper_Control();
-                break;
+
+    /// Reload the action file when it changes; a missed reload silently runs the
+    /// previous table. The file timestamp is checked once a second at 1kHz.
+    void watch_actions_file() {
+        if (actions_file_path_.empty())
+            return;
+        if (++actions_watch_counter_ < 1000)
+            return;
+        actions_watch_counter_ = 0;
+        std::error_code code;
+        const auto stamp = std::filesystem::last_write_time(actions_file_path_, code);
+        if (code || stamp == actions_file_stamp_)
+            return;
+        actions_file_stamp_ = stamp;  // recorded first, so a broken file is not retried every second
+        if (load_actions_once())
+            RCLCPP_INFO(
+                get_logger(), "Action: '%s' changed, reloaded automatically",
+                actions_file_path_.c_str());
+        else
+            RCLCPP_WARN(get_logger(), "Action: reload failed, keep previous table");
+    }
+
+    /// VT03 switch plus FN1/FN2 select the arm mode:
+    ///   MIDDLE + FN1 off -> vt03 position
+    ///   MIDDLE + FN1 on  -> vt03 orientation
+    ///   MIDDLE + FN2     -> drag teach (overrides FN1)
+    ///   RIGHT  + FN2 off -> gripper mode, arm held where it is
+    ///   RIGHT  + FN2 on  -> custom controller, /arm/tuning/joint_target
+    ///   LEFT             -> disabled
+    void mode_selection() {
+        using namespace rmcs_msgs;
+        const auto sw = *mode_switch_;
+        if (sw == VtSwitch::MIDDLE && fn2_toggle_)
+            *arm_mode_ = ArmMode::Drag;
+        else if (sw == VtSwitch::MIDDLE)
+            *arm_mode_ = fn1_toggle_ ? ArmMode::execute_vt03_orientation
+                                     : ArmMode::execute_vt03_position;
+        else if (sw == VtSwitch::RIGHT)
+            *arm_mode_ = fn2_toggle_ ? ArmMode::Custome : ArmMode::Gripper;
+        else
+            *arm_mode_ = ArmMode::None;
+    }
+    void arm_control() {
+        using namespace rmcs_msgs;
+        switch (*arm_mode_) {
+        case ArmMode::Custome: execute_custome(); break;
+        case ArmMode::execute_vt03_position: Vt03_Position_Control(); break;
+        case ArmMode::execute_vt03_orientation: Vt03_Orientation_Control(); break;
+        case ArmMode::Drag: execute_drag(); break;
+        // Gripper mode leaves the arm where it is; the knob drives the gripper.
+        default: break;
         }
-            default: {
-                break;
-            }
-        }
-    };
-    void Gripper_Control(){
-        // RCLCPP_INFO(rclcpp::get_logger("ArmController"),"Gripper Control Mode Active");
     }
     void execute_custome(){
         RCLCPP_INFO_THROTTLE(
@@ -233,6 +283,32 @@ private:
             *target_theta[i] = std::clamp(tuning_target_[i], lower, upper);
         }
     } 
+    void execute_drag(){
+        constexpr std::size_t kHoldJoint = 4;     
+        constexpr double kMoveThreshold = 0.02;   
+        constexpr int kStillCycles = 300;          
+        RCLCPP_INFO_THROTTLE(
+            get_logger(), *this->get_clock(), 2000,
+            "Tuning: Drag mode active, the arm is compliant - pull it by hand");
+        for (std::size_t i = 0; i < 6; ++i) {
+            if (!theta[i].ready() || std::isnan(*theta[i]))
+                continue;
+
+            if (i != kHoldJoint) {
+                *target_theta[i] = *theta[i];
+                continue;
+            }
+
+            const double moved = std::fabs(*theta[i] - last_drag_theta_[i]) * 1000.0;
+            last_drag_theta_[i] = *theta[i];
+            if (moved > kMoveThreshold) {
+                drag_still_cycles_ = 0;
+                *target_theta[i] = *theta[i];
+            } else if (++drag_still_cycles_ < kStillCycles) {
+                *target_theta[i] = *theta[i];
+            }
+        }
+    }
     void Vt03_Position_Control(){
         constexpr double DEADZONE = 0.05; 
         constexpr double STEP = 0.003;
@@ -295,7 +371,42 @@ private:
         for (std::size_t i = 0; i < 6; ++i) {
             *target_theta[i] = theta[i].ready() ? *theta[i] : 0.0;
         }
-        custom_joint_filter_.reset();
+        // Disabled: the gripper is not self-locking, so it goes limp and opens.
+        *gripper_target_ = NAN;
+        gripper_state_ = GripperState::None;
+    }
+
+    void gripper_control(){
+        if (!*is_arm_enable_) {
+            *gripper_target_ = NAN;
+            return;
+        }
+        // While an action runs, the knob must not override its open/close events, or a
+        // knob left off-centre would cancel the gripper step on the same cycle.
+        if (action_phase_ != ActionPhase::Executing) {
+            const double knob = rotary_knob_.ready() ? *rotary_knob_ : 0.0;
+            if (knob > kGripperKnobDeadzone)
+                gripper_state_ = GripperState::Open;
+            else if (knob < -kGripperKnobDeadzone)
+                gripper_state_ = GripperState::Close;
+        }
+
+        double desired = NAN;
+        switch (gripper_state_) {
+        case GripperState::Open: desired = kGripperOpenAngle; break;
+        case GripperState::Close: desired = kGripperCloseAngle; break;
+        case GripperState::None: break;
+        }
+        if (!std::isfinite(desired)) {
+            *gripper_target_ = NAN;
+            return;
+        }
+        if (std::isnan(*gripper_target_))
+            *gripper_target_ =
+                (gripper_angle_.ready() && std::isfinite(*gripper_angle_)) ? *gripper_angle_ : desired;
+        constexpr double kStepPerCycle = kGripperSpeed / 1000.0;  // 1kHz
+        *gripper_target_ +=
+            std::clamp(desired - *gripper_target_, -kStepPerCycle, kStepPerCycle);
     }
 
 
@@ -313,9 +424,28 @@ private:
             action->second.size());
     }
 
+    /// Disabling the arm drops any running action. Without this the elapsed time keeps
+    /// running while the switch is off, and the arm jumps when it comes back on.
+    void abort_action() {
+        if (action_phase_ == ActionPhase::Idle)
+            return;
+        RCLCPP_WARN(get_logger(), "Action: '%s' aborted, arm disabled", action_name_.c_str());
+        trajectory_   = nullptr;
+        action_phase_ = ActionPhase::Idle;
+    }
+
     void action_update() {
         switch (action_phase_) {
         case ActionPhase::Idle:
+            // Part of the error at the end of a trajectory is just lag. Measuring again a
+            // moment later separates dynamic lag from a static offset.
+            if (settled_check_at_.nanoseconds() != 0 && this->now() >= settled_check_at_) {
+                settled_check_at_ = rclcpp::Time{0, 0, RCL_ROS_TIME};
+                RCLCPP_INFO(
+                    get_logger(), "Action: '%s' settled state (%.0fs later):",
+                    action_name_.c_str(), kSettledCheckDelay);
+                report_goal_error();
+            }
             break;
 
         case ActionPhase::Planning: {
@@ -330,7 +460,7 @@ private:
                 action_phase_ = ActionPhase::Error;
                 break;
             }
-            // 规划结果不保证关节顺序,按名字建立映射
+            // Planned joint order is not guaranteed, map by name.
             joint_index_map_.fill(-1);
             for (std::size_t i = 0; i < 6; ++i) {
                 const std::string wanted = "joint_" + std::to_string(i + 1);
@@ -348,6 +478,7 @@ private:
                 break;
             trajectory_   = trajectory;
             point_index_  = 0;
+            next_event_index_ = 0;
             action_start_ = std::chrono::steady_clock::now();
             action_phase_ = ActionPhase::Executing;
             RCLCPP_INFO(
@@ -357,17 +488,37 @@ private:
         }
 
         case ActionPhase::Executing: {
-            // 按规划给出的时间戳推进,而不是按调用周期推点
+            // Advance on the planned timestamps, not on the control period.
             const double elapsed = std::chrono::duration<double>(
                                        std::chrono::steady_clock::now() - action_start_)
                                        .count();
             const auto& points = trajectory_->points;
+            if (points.empty()) {
+                action_phase_ = ActionPhase::Done;
+                break;
+            }
+            // Fire gripper events on time; they only change state.
+            while (next_event_index_ < trajectory_->events.size()
+                   && elapsed >= trajectory_->events[next_event_index_].time) {
+                switch (trajectory_->events[next_event_index_].type) {
+                case Action::MotionType::OpenGripper:
+                    gripper_state_ = GripperState::Open;
+                    RCLCPP_INFO(get_logger(), "Action: open gripper at %.2fs", elapsed);
+                    break;
+                case Action::MotionType::CloseGripper:
+                    gripper_state_ = GripperState::Close;
+                    RCLCPP_INFO(get_logger(), "Action: close gripper at %.2fs", elapsed);
+                    break;
+                default: break;
+                }
+                ++next_event_index_;
+            }
             while (point_index_ + 1 < points.size()
                    && rclcpp::Duration(points[point_index_ + 1].time_from_start).seconds()
                           <= elapsed)
                 ++point_index_;
 
-            // 相邻轨迹点之间线性插值
+            // Linear interpolation between adjacent trajectory points.
             const auto& point = points[point_index_];
             const bool has_next = point_index_ + 1 < points.size();
             const auto& next    = has_next ? points[point_index_ + 1] : point;
@@ -387,6 +538,12 @@ private:
                 const double position = point.positions[source];
                 const double position_next = next.positions[source];
                 *target_theta[i] = position + ratio * (position_next - position);
+                // Same interpolation for the feedforward velocity.
+                double velocity = 0.0;
+                if (source < point.velocities.size() && source < next.velocities.size())
+                    velocity = point.velocities[source]
+                               + ratio * (next.velocities[source] - point.velocities[source]);
+                *target_velocity[i] = velocity;
             }
             if (elapsed >= trajectory_->duration) {
                 action_phase_ = ActionPhase::Done;
@@ -399,7 +556,8 @@ private:
         case ActionPhase::Done: {
             if (trajectory_ && !trajectory_->points.empty())
                 point_index_ = trajectory_->points.size() - 1;
-            report_goal_error();
+            if (report_goal_error() > kSettledCheckThreshold)
+                settled_check_at_ = this->now() + rclcpp::Duration::from_seconds(kSettledCheckDelay);
             report_action_status();
             action_phase_ = ActionPhase::Idle;
             return;
@@ -413,11 +571,13 @@ private:
         report_action_status();
     }
 
-    void report_goal_error() const {
+    /// Log target/actual/error per joint and the tool-space error in mm. Max in m.
+    double report_goal_error() const {
         if (!trajectory_ || trajectory_->points.empty())
-            return;
+            return 0.0;
         const auto& goal = trajectory_->points.back();
-        double max_error = 0.0;
+        double max_error     = 0.0;
+        double max_tcp_error = 0.0;
         for (std::size_t i = 0; i < 6; ++i) {
             const auto source = static_cast<std::size_t>(joint_index_map_[i]);
             if (source >= goal.positions.size())
@@ -426,20 +586,32 @@ private:
             const double actual =
                 theta[i].ready() ? *theta[i] : std::numeric_limits<double>::quiet_NaN();
             const double error = target - actual;
+            // Tool displacement per radian of this joint, to report the error in mm.
+            const double sensitivity = source < trajectory_->joint_tcp_sensitivity.size()
+                                           ? trajectory_->joint_tcp_sensitivity[source]
+                                           : 0.0;
+            const double tcp_error = std::fabs(error) * sensitivity;
             if (std::isfinite(error))
                 max_error = std::max(max_error, std::fabs(error));
+            if (std::isfinite(tcp_error))
+                max_tcp_error = std::max(max_tcp_error, tcp_error);
             RCLCPP_INFO(
-                get_logger(), "Action: joint_%zu target=%+.4f actual=%+.4f error=%+.4f rad", i + 1,
-                target, actual, error);
+                get_logger(),
+                "Action: joint_%zu target=%+.4f actual=%+.4f error=%+.4f rad (about %.1f mm at "
+                "the tool)",
+                i + 1, target, actual, error, tcp_error * 1000.0);
         }
-        RCLCPP_INFO(get_logger(), "Action: max error = %.4f rad", max_error);
+        RCLCPP_INFO(
+            get_logger(), "Action: max error = %.4f rad, about %.1f mm at the tool", max_error,
+            max_tcp_error * 1000.0);
+        return max_tcp_error;
     }
 
     void report_action_status() {
         static const char* const phase_names[] = {"idle", "planning", "executing", "done", "error"};
         const auto now = this->now();
         const bool phase_changed = action_phase_ != last_reported_phase_;
-        // 阶段变化立即发;同一阶段内部限流到 10Hz
+        // Publish immediately on a phase change, otherwise throttle to 10Hz.
         if (!phase_changed && last_status_time_.nanoseconds() != 0
             && (now - last_status_time_).seconds() < 0.1)
             return;
@@ -456,8 +628,29 @@ private:
     }
 
     enum class ActionPhase : std::uint8_t { Idle, Planning, Executing, Done, Error };
+
+    enum class GripperState : std::uint8_t { None, Open, Close };
+    static constexpr double kSettledCheckThreshold = 0.002;  // m, report only above this
+    static constexpr double kSettledCheckDelay     = 1.0;    // s
+    rclcpp::Time settled_check_at_{0, 0, RCL_ROS_TIME};
+    // Measured: the smaller angle is open, the larger is closed. Swap if the gripper
+    // is rewired.
+    static constexpr double kGripperOpenAngle = 0.59;
+    static constexpr double kGripperCloseAngle = 2.29;
+    static constexpr double kGripperKnobDeadzone = 0.2;  // knob dead zone, normalized to +-1
+    // Gripper ramp rate, rad/s. The gear mesh does not like shocks; 1.7 rad of travel
+    // at 1.0 takes about 1.7s.
+    static constexpr double kGripperSpeed = 1.0;
+    GripperState gripper_state_{GripperState::None};
+    OutputInterface<double> gripper_target_;
+    InputInterface<double> gripper_angle_;
+    std::size_t next_event_index_{0};
+
     ActionMachine action_machine_;
     ActionLoader::ActionMap actions_;
+    std::string actions_file_path_;
+    std::filesystem::file_time_type actions_file_stamp_{};
+    std::uint32_t actions_watch_counter_{0};
     ActionPhase action_phase_{ActionPhase::Idle};
     std::string action_name_;
     uint64_t last_handled_request_id_{0};
@@ -468,12 +661,15 @@ private:
     rclcpp::Time last_status_time_{0, 0, RCL_ROS_TIME};
     ActionPhase last_reported_phase_{ActionPhase::Idle};
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr action_trigger_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr action_reload_sub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr action_status_pub_;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr tuning_target_sub_;
     std::array<double, 6> tuning_target_{
         {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
          std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
          std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()}};
+    std::array<double, 6> last_drag_theta_{};
+    int drag_still_cycles_{0};
 
     rmcs_msgs::ArmMode last_arm_mode_{rmcs_msgs::ArmMode::None};
     bool last_fn_1_{false};
@@ -488,11 +684,12 @@ private:
     InputInterface<Eigen::Vector2d> joystick_left_;
     OutputInterface<rmcs_msgs::ArmMode> arm_mode_;
     OutputInterface<bool> is_arm_enable_;
+    OutputInterface<bool> is_drag_enabled_;
     std::array<InputInterface<double>,6> joint_lower_limit_;
     std::array<InputInterface<double>,6> joint_upper_limit_;
     InputInterface<double> theta[6];
     OutputInterface<double> target_theta[6];
-    utility::LowPassFilter<6> custom_joint_filter_;
+    OutputInterface<double> target_velocity[6];
     };
 } // namespace rmcs_core::controller::arm
 

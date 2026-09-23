@@ -1,59 +1,66 @@
-# 触发方式:
-#   ros2 topic pub --once /arm/action/trigger std_msgs/msg/String "{data: <动作名>}"
-# Step 类型:
-#   joint          关节角目标        joint: [j1, j2, j3, j4, j5, j6]   单位 rad
-#   pose           笛卡尔位姿目标    xyz: [x, y, z] 单位 m ; rpy: [r, p, y] 单位 rad
-#   linear         相对直线运动      dir: [dx, dy, dz] ; distance: 米
-#   open_gripper / close_gripper
-#   delay          原地等待          duration: 秒
-#   read_pose      不动作,只打印当前末端位姿(示教时用来抄数)
-
-weigh_pose:
-  - type: joint
-    joint: [0.0, 0.9, -0.4, 0.0, 0.0, 0.0]
-    vel: 0.15
-    acc: 0.15
-
-test:
-  - type: joint
-    joint: [0.0, -1.1500, 1.3265, 0.0, 0.0, 0.0]
-    vel: 0.2
-    acc: 0.2
-
-folded:
-  - type: joint
-    joint: [0.0, -1.3265, 1.3265, 0.0, 0.0, 0.0]
-    vel: 0.2
-    acc: 0.2
-
 zero:
   - type: joint
     joint: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     vel: 0.2
     acc: 0.2
 
-# 示教辅助:触发后日志会打印当前末端位姿(x/y/z + rpy),照着填到下面的 pose 里
 read_pose:
   - type: read_pose
-# ──────────── 存矿(模板,参数待示教填入)────────────
-#
-# storage_lf:
-#   - type: pose
-#     xyz: [0.000, 0.000, 0.000]
-#     rpy: [0.000, 0.000, 0.000]
-#     vel: 0.03
-#     acc: 0.03
-#     tol_pos: 0.003
-#     tol_ori: 0.05
-#   - type: linear
-#     dir: [-1.0, 0.0, 0.0]      # 往储物格里插
-#     distance: 0.16
-#     vel: 0.03
-#     acc: 0.2
-#   - type: open_gripper
-#   - type: delay
-#     duration: 0.3
-#   - type: linear
-#     dir: [0.0, 0.0, 1.0]       # 抬起来退出
-#     distance: 0.11
-#     vel: 0.05
+
+read_joint:
+  - type: read_joint
+
+inital_pose:
+  - type: joint
+    joint: [0.0146, -0.8601, 0.9053, -0.0023, -0.0107, -0.1043]
+    vel: 0.2
+    acc: 0.2
+
+close_test:
+  - type: close_gripper
+  - type: delay
+    duration: 0.3
+
+open_test:
+  - type: open_gripper
+  - type: delay
+    duration: 0.3
+
+test_ready:
+  - type: joint
+    joint: [0.0, -0.8, 0.9, 0.0, 0.3, 0.0]
+    vel: 0.2
+    acc: 0.2
+
+test_x:
+  - type: linear
+    dir: [1.0, 0.0, 0.0]
+    distance: 0.03
+    frame: base
+    vel: 0.05
+
+test_y:
+  - type: linear
+    dir: [0.0, 1.0, 0.0]
+    distance: 0.03
+    frame: base
+    vel: 0.05
+
+test_z:
+  - type: linear
+    dir: [0.0, 0.0, 1.0]
+    distance: 0.2
+    frame: base
+    vel: 0.05
+
+storage_lf:
+  - type: trajectory
+    file: /home/ws/src/bringup/config/trajectories/LF_Rising.csv
+    vel: 0.5
+    acc: 0.5
+  - type: close_gripper
+    duration: 2.0
+  - type: trajectory
+    file: /home/ws/src/bringup/config/trajectories/LF_PICK.csv
+    vel: 0.5
+    acc: 0.5

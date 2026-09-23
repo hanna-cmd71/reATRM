@@ -27,7 +27,7 @@ ament_auto_add_library (
 set_source_files_properties(
   src/controller/arm/IKfast/ikfast.h  
   src/controller/arm/IKfast/jgarm_arm_ikfast_solver.cpp  
-  PROPERTIES COMPILE_FLAGS "-w"    
+  PROPERTIES COMPILE_FLAGS "-w -DIKFAST_NO_MAIN"    
 )
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_SOURCE_DIR}/src)

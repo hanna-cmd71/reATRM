@@ -323,8 +323,8 @@
     <axis
       xyz="0 0 -1" />
     <limit
-      lower="-1.967"
-      upper="1.937"
+      lower="-0.70"
+      upper="0.75"
       effort="6"
       velocity="20" />
     <dynamics
